@@ -1,6 +1,7 @@
 import os
+import asyncio
 import requests
-from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright
 
 DISCORD_WEBHOOK = os.environ["DISCORD_WEBHOOK"]
 
@@ -27,41 +28,53 @@ def get_posts():
     return r.json()["content"]["feeds"]
 
 
-def get_article(feed_id):
+async def get_article(feed_id):
     url = (
         f"https://game.naver.com/lounge/"
         f"Tree_Of_Savior_Neverland/board/detail/{feed_id}"
     )
 
-    r = requests.get(url, headers=HEADERS, timeout=30)
-    r.raise_for_status()
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
 
-    soup = BeautifulSoup(r.text, "html.parser")
+        page = await browser.new_page(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/140.0.0.0 Safari/537.36"
+            )
+        )
 
-    # 페이지에서 본문으로 보이는 영역 찾기
-    candidates = []
+        await page.goto(
+            url,
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
 
-    for tag in soup.find_all(["article", "div", "section"]):
-        text = tag.get_text("\n", strip=True)
+        # 네이버 페이지가 내용을 불러올 시간을 줌
+        await page.wait_for_timeout(5000)
 
-        if len(text) >= 100:
-            candidates.append((len(text), tag))
+        title = await page.title()
 
-    if candidates:
-        # 너무 큰 페이지 전체 영역은 제외하고 적당한 영역 선택
-        candidates.sort(key=lambda x: x[0])
+        # 페이지에 실제로 표시된 텍스트 가져오기
+        body_text = await page.locator("body").inner_text()
 
-        for length, tag in candidates:
-            if length <= 10000:
-                content = tag.get_text("\n", strip=True)
-                if content:
-                    return content, tag
+        # 이미지 주소 수집
+        images = await page.locator("img").evaluate_all(
+            """
+            imgs => imgs
+                .map(img => img.src)
+                .filter(src => src && src.startsWith('http'))
+            """
+        )
 
-    return "본문을 가져오지 못했습니다.", soup
+        await browser.close()
+
+        return title, body_text, images, url
 
 
 def send_discord(title, content, url, image_url=None):
-    # Discord embed 설명은 너무 길면 잘라냄
+    # 페이지 전체 텍스트에서 너무 긴 부분 제거
     if len(content) > 3900:
         content = content[:3900] + "\n\n…본문 일부 생략"
 
@@ -72,7 +85,9 @@ def send_discord(title, content, url, image_url=None):
     }
 
     if image_url:
-        embed["image"] = {"url": image_url}
+        embed["image"] = {
+            "url": image_url
+        }
 
     payload = {
         "embeds": [embed]
@@ -96,34 +111,23 @@ def main():
 
     post = posts[0]
 
-    title = post.get("title", "트오세 네버랜드 공지")
     feed_id = post.get("feedId")
 
-    url = (
-        f"https://game.naver.com/lounge/"
-        f"Tree_Of_Savior_Neverland/board/detail/{feed_id}"
+    print("feedId:", feed_id)
+
+    title, content, images, url = asyncio.run(
+        get_article(feed_id)
     )
 
-    print("공지:", title)
-    print("주소:", url)
-
-    content, article = get_article(feed_id)
-
-    # 본문에 들어있는 첫 번째 이미지 찾기
-    image_url = None
-
-    for img in article.find_all("img"):
-        src = img.get("src") or img.get("data-src")
-
-        if src and src.startswith("http"):
-            image_url = src
-            break
+    print("페이지 제목:", title)
+    print("본문 길이:", len(content))
+    print("이미지 개수:", len(images))
 
     send_discord(
-        title,
+        post.get("title", "트오세 네버랜드 공지"),
         content,
         url,
-        image_url,
+        images[0] if images else None,
     )
 
     print("Discord 전송 성공!")

@@ -24,6 +24,7 @@ def get_posts():
         headers=HEADERS,
         timeout=30,
     )
+
     r.raise_for_status()
     return r.json()["content"]["feeds"]
 
@@ -35,6 +36,7 @@ async def get_article(feed_id):
     )
 
     async with async_playwright() as p:
+
         browser = await p.chromium.launch(headless=True)
 
         page = await browser.new_page(
@@ -51,30 +53,74 @@ async def get_article(feed_id):
             timeout=60000,
         )
 
-        # 네이버 페이지가 내용을 불러올 시간을 줌
         await page.wait_for_timeout(5000)
 
-        title = await page.title()
+        # 네이버 게임 라운지에서 본문으로 사용되는 요소들을 찾음
+        selectors = [
+            "[class*='article']",
+            "[class*='Article']",
+            "[class*='content']",
+            "[class*='Content']",
+            "[class*='post']",
+            "[class*='Post']",
+        ]
 
-        # 페이지에 실제로 표시된 텍스트 가져오기
-        body_text = await page.locator("body").inner_text()
+        best_element = None
+        best_length = 0
 
-        # 이미지 주소 수집
-        images = await page.locator("img").evaluate_all(
-            """
-            imgs => imgs
-                .map(img => img.src)
-                .filter(src => src && src.startsWith('http'))
-            """
-        )
+        for selector in selectors:
+
+            elements = page.locator(selector)
+
+            count = await elements.count()
+
+            for i in range(count):
+
+                element = elements.nth(i)
+
+                try:
+                    if not await element.is_visible():
+                        continue
+
+                    text = await element.inner_text()
+
+                    length = len(text.strip())
+
+                    # 너무 짧거나 페이지 전체에 가까운 영역은 제외
+                    if 100 <= length <= 10000:
+
+                        if length > best_length:
+                            best_length = length
+                            best_element = element
+
+                except Exception:
+                    continue
+
+        if best_element:
+
+            content = await best_element.inner_text()
+
+            images = await best_element.locator("img").evaluate_all(
+                """
+                imgs => imgs
+                    .map(img => img.src)
+                    .filter(src => src && src.startsWith('http'))
+                """
+            )
+
+        else:
+
+            content = "본문 영역을 찾지 못했습니다."
+
+            images = []
 
         await browser.close()
 
-        return title, body_text, images, url
+        return content.strip(), images, url
 
 
 def send_discord(title, content, url, image_url=None):
-    # 페이지 전체 텍스트에서 너무 긴 부분 제거
+
     if len(content) > 3900:
         content = content[:3900] + "\n\n…본문 일부 생략"
 
@@ -85,6 +131,7 @@ def send_discord(title, content, url, image_url=None):
     }
 
     if image_url:
+
         embed["image"] = {
             "url": image_url
         }
@@ -103,9 +150,11 @@ def send_discord(title, content, url, image_url=None):
 
 
 def main():
+
     posts = get_posts()
 
     if not posts:
+
         print("게시글을 찾지 못했습니다.")
         return
 
@@ -113,18 +162,23 @@ def main():
 
     feed_id = post.get("feedId")
 
+    title = post.get(
+        "title",
+        "트오세 네버랜드 공지"
+    )
+
+    print("공지:", title)
     print("feedId:", feed_id)
 
-    title, content, images, url = asyncio.run(
+    content, images, url = asyncio.run(
         get_article(feed_id)
     )
 
-    print("페이지 제목:", title)
     print("본문 길이:", len(content))
-    print("이미지 개수:", len(images))
+    print("본문 이미지:", len(images))
 
     send_discord(
-        post.get("title", "트오세 네버랜드 공지"),
+        title,
         content,
         url,
         images[0] if images else None,

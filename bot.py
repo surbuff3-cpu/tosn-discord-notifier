@@ -1,11 +1,15 @@
 import os
+import json
 import asyncio
 import requests
+from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 
 DISCORD_WEBHOOK = os.environ["DISCORD_WEBHOOK"]
 
 API_URL = "https://comm-api.game.naver.com/nng_main/v1/community/lounge/Tree_Of_Savior_Neverland/feed"
+
+STATE_FILE = "sent_posts.json"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0"
@@ -17,7 +21,7 @@ def get_posts():
         API_URL,
         params={
             "boardId": 3,
-            "limit": 5,
+            "limit": 20,
             "offset": 0,
             "order": "NEW",
         },
@@ -29,7 +33,29 @@ def get_posts():
     return r.json()["content"]["feeds"]
 
 
+def load_sent_posts():
+    if not os.path.exists(STATE_FILE):
+        return set()
+
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+
+def save_sent_posts(sent_posts):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(
+            list(sent_posts)[-100:],
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+
 async def get_article(feed_id):
+
     url = (
         f"https://game.naver.com/lounge/"
         f"Tree_Of_Savior_Neverland/board/detail/{feed_id}"
@@ -55,7 +81,6 @@ async def get_article(feed_id):
 
         await page.wait_for_timeout(5000)
 
-        # 네이버 게임 라운지에서 본문으로 사용되는 요소들을 찾음
         selectors = [
             "[class*='article']",
             "[class*='Article']",
@@ -79,6 +104,7 @@ async def get_article(feed_id):
                 element = elements.nth(i)
 
                 try:
+
                     if not await element.is_visible():
                         continue
 
@@ -86,7 +112,6 @@ async def get_article(feed_id):
 
                     length = len(text.strip())
 
-                    # 너무 짧거나 페이지 전체에 가까운 영역은 제외
                     if 100 <= length <= 10000:
 
                         if length > best_length:
@@ -98,8 +123,10 @@ async def get_article(feed_id):
 
         if best_element:
 
+            # 본문 영역의 텍스트
             content = await best_element.inner_text()
 
+            # 본문 영역의 이미지
             images = await best_element.locator("img").evaluate_all(
                 """
                 imgs => imgs
@@ -110,13 +137,46 @@ async def get_article(feed_id):
 
         else:
 
-            content = "본문 영역을 찾지 못했습니다."
-
+            content = ""
             images = []
 
         await browser.close()
 
         return content.strip(), images, url
+
+
+def clean_content(content, title):
+
+    lines = [
+        line.strip()
+        for line in content.splitlines()
+        if line.strip()
+    ]
+
+    # 제목이 본문에 중복으로 들어가는 경우 제거
+    cleaned = []
+
+    for line in lines:
+
+        if line == title:
+            continue
+
+        # 글 상단 메타정보 제거
+        if "북마크 메뉴" in line:
+            continue
+
+        if "조회수" in line and len(line) < 200:
+            continue
+
+        if "LV " in line and "GM" in line:
+            continue
+
+        if "트리오브세이비어:네버랜드 관리자 안내" in line:
+            continue
+
+        cleaned.append(line)
+
+    return "\n".join(cleaned)
 
 
 def send_discord(title, content, url, image_url=None):
@@ -131,7 +191,6 @@ def send_discord(title, content, url, image_url=None):
     }
 
     if image_url:
-
         embed["image"] = {
             "url": image_url
         }
@@ -154,37 +213,76 @@ def main():
     posts = get_posts()
 
     if not posts:
-
         print("게시글을 찾지 못했습니다.")
         return
 
-    post = posts[0]
+    sent_posts = load_sent_posts()
 
-    feed_id = post.get("feedId")
+    new_posts = []
 
-    title = post.get(
-        "title",
-        "트오세 네버랜드 공지"
-    )
+    for post in posts:
 
-    print("공지:", title)
-    print("feedId:", feed_id)
+        feed_id = post.get("feedId")
 
-    content, images, url = asyncio.run(
-        get_article(feed_id)
-    )
+        if not feed_id:
+            continue
 
-    print("본문 길이:", len(content))
-    print("본문 이미지:", len(images))
+        if str(feed_id) not in sent_posts:
+            new_posts.append(post)
 
-    send_discord(
-        title,
-        content,
-        url,
-        images[0] if images else None,
-    )
+    # 처음 실행할 때 기존 글을 전부 보내지 않도록 함
+    if not os.path.exists(STATE_FILE):
 
-    print("Discord 전송 성공!")
+        for post in posts:
+            feed_id = post.get("feedId")
+
+            if feed_id:
+                sent_posts.add(str(feed_id))
+
+        save_sent_posts(sent_posts)
+
+        print("기존 게시글을 기억했습니다.")
+        print("앞으로 새 글이 올라오면 Discord로 전송합니다.")
+        return
+
+    # 새 글만 처리
+    for post in reversed(new_posts):
+
+        feed_id = post.get("feedId")
+
+        title = post.get(
+            "title",
+            "트오세 네버랜드 공지"
+        )
+
+        print("새 공지 발견:", title)
+
+        content, images, url = asyncio.run(
+            get_article(feed_id)
+        )
+
+        content = clean_content(
+            content,
+            title
+        )
+
+        if not content:
+            content = "본문을 가져오지 못했습니다."
+
+        image_url = images[0] if images else None
+
+        send_discord(
+            title,
+            content,
+            url,
+            image_url,
+        )
+
+        sent_posts.add(str(feed_id))
+
+        print("Discord 전송 완료:", title)
+
+    save_sent_posts(sent_posts)
 
 
 if __name__ == "__main__":
